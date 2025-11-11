@@ -1,15 +1,22 @@
 # config.py
 import os
-from dotenv import load_dotenv
-load_dotenv()
 
-def _int_env(name: str, default: int = 0) -> int:
-    val = os.getenv(name, "")
+# Try to load .env locally; ignore if missing on Render
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+def _int_env(key: str, default: int | None = None) -> int | None:
+    v = os.getenv(key)
+    if v is None or v == "":
+        return default
     try:
-        return int(val) if val else int(default)
+        return int(v)
     except ValueError:
-        print(f"WARNING: {name}='{val}' is not an integer; using {default}")
-        return int(default)
+        # allow numeric strings only; raise with context
+        raise ValueError(f"Environment var {key} must be an integer; got {v!r}")
 
 DISCORD_TOKEN        = os.getenv("DISCORD_TOKEN", "")
 TIMEZONE             = os.getenv("TIMEZONE", "America/Chicago")
