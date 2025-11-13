@@ -48,7 +48,7 @@ def week_start_date(dt=None):
     return (now - timedelta(days=now.weekday())).date()
 
 async def post_weekly_message(bot: discord.Client):
-    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID)
+    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID) # type: ignore
     conn = get_db()
     cur = conn.cursor()
 
@@ -89,7 +89,7 @@ async def backup_now(bot: discord.Client):
     backup_name = p.parent / f"backup_{datetime.now(tz).strftime('%Y%m%d_%H%M%S')}.db"
     copyfile(p, backup_name)
     # ... make backup_name ...
-    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID)
+    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID) # type: ignore
     if channel:
         await channel.send(f"💾 Auto-backup saved: `{backup_name.name}`")
 
@@ -126,7 +126,7 @@ async def evaluate_week(bot: discord.Client):
                 if not row or not row["done"]:
                     failed_users.append(uid)
 
-    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID)
+    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID) # type: ignore
     if channel is None:
         print("ERROR: CHALLENGE_CHANNEL_ID is not a messageable channel or not found.")
         return
@@ -212,7 +212,7 @@ async def reset_week(bot: discord.Client):
     conn.close()
 
     # resolve a messageable channel
-    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID)
+    channel = _resolve_message_channel(bot, CHALLENGE_CHANNEL_ID) # type: ignore
     if channel is None:
         print("ERROR reset_week: CHALLENGE_CHANNEL_ID not found or not messageable")
         return
