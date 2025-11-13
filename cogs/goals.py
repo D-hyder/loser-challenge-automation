@@ -116,13 +116,12 @@ class GoalsCog(commands.Cog):
 
     @app_commands.command(
         name="loser",
-        description="Log progress: incremental (amount/set_to) or weekly-final (value)."
+        description="Log progress: incremental-style goals (amount/set_to)."
     )
     @app_commands.describe(
-        name="Your goal name (exact as saved)",
-        amount="Incremental: add this number (e.g., +1 (default))",
-        set_to="Incremental: set your running total to this number",
-        value="Weekly-final goals: your final number for this week (e.g., 7)",
+        name="Your goal name (as saved)",
+        amount="Add this number (e.g., +1 (default))",
+        set_to="Set your running total to this number",
         note="Optional note (shown in /history and /me)"
     )
     async def loser(
@@ -131,7 +130,6 @@ class GoalsCog(commands.Cog):
         name: str,
         amount: Optional[int] = 1,
         set_to: Optional[int] = None,
-        value: Optional[int] = None,
         note: Optional[str] = None,
     ):
         uid = interaction.user.id
@@ -166,6 +164,14 @@ class GoalsCog(commands.Cog):
                 ephemeral=True
             )
             conn.close(); return
+        
+        # Weekly-final count goals: use /final instead
+        if gtype == "count" and style == "weekly_final":
+            await interaction.response.send_message(
+                f"ℹ️ `{goal_name}` is a weekly-final goal. Use `/final name:{goal_name} value:<number>`.",
+                ephemeral=True
+            )
+            conn.close(); return
 
         # COUNT + INCREMENTAL
         if gtype == "count" and style == "incremental":
@@ -176,6 +182,7 @@ class GoalsCog(commands.Cog):
                 )
                 conn.close(); return
 
+            # current total
             r = cur.execute(
                 "SELECT value_total FROM progress WHERE user_id=? AND week_start=? AND name=?",
                 (uid, w, goal_name)
@@ -210,33 +217,6 @@ class GoalsCog(commands.Cog):
                 msg = (f"**{interaction.user.display_name}** updated `{goal_name}`: +{add} → "
                     f"**{new_total}/{target}**{unit_sfx} (incremental).")
 
-            if note:
-                msg += f"  _{note}_"
-            await interaction.response.send_message(msg)  # PUBLIC
-            conn.close(); return
-
-        # COUNT + WEEKLY_FINAL
-        if gtype == "count" and style == "weekly_final":
-            if value is None:
-                await interaction.response.send_message(
-                    "❌ Weekly-final goal needs `value` (your final number for the week).",
-                    ephemeral=True
-                )
-                conn.close(); return
-
-            final_val = max(0, int(value))
-            cur.execute("""
-                INSERT OR REPLACE INTO finals (user_id, week_start, name, value)
-                VALUES (?, ?, ?, ?)
-            """, (uid, w, goal_name, final_val))
-            cur.execute("""
-                INSERT INTO logs (user_id, week_start, name, kind, delta, set_to, note, ts_utc)
-                VALUES (?, ?, ?, 'weekly_final', NULL, ?, ?, ?)
-            """, (uid, w, goal_name, final_val, note, _utc_now_iso()))
-            conn.commit()
-
-            msg = (f"**{interaction.user.display_name}** set weekly-final `{goal_name}` = "
-                f"**{final_val}/{target}**{unit_sfx}.")
             if note:
                 msg += f"  _{note}_"
             await interaction.response.send_message(msg)  # PUBLIC
