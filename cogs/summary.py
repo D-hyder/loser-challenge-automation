@@ -95,9 +95,9 @@ class SummaryCog(commands.Cog):
 
         lines = [f"**Team Summary – Week of {w}**"]
 
-        # Team-level totals
-        team_current_total = 0   # numerator
-        team_target_total = 0    # denominator
+        # Team-level totals (all treated as "units")
+        team_current_total = 0
+        team_target_total = 0
 
         participants = cur.execute("""
             SELECT DISTINCT user_id FROM goals_default
@@ -113,10 +113,7 @@ class SummaryCog(commands.Cog):
         for row in participants:
             uid = row["user_id"]
             guild = interaction.guild
-            if guild:
-                member = guild.get_member(uid)
-            else:
-                member = None
+            member = guild.get_member(uid) if guild else None
             display = member.display_name if member else f"User {uid}"
 
             user_goals = cur.execute("""
@@ -129,22 +126,21 @@ class SummaryCog(commands.Cog):
             if not user_goals:
                 continue
 
-            lines.append(f"\n__**{display}**__")
+            goal_bits: list[str] = []
 
             for g in user_goals:
                 goal_name = g["name"]
-                gtype     = g["type"]
+                gtype     = g["type"]          # 'count' | 'boolean'
                 target    = g["target"]
-                style     = g["log_style"]
+                style     = g["log_style"]     # 'incremental' | 'weekly_final'
                 unit      = g["unit"]
                 unit_sfx  = f" {unit}".rstrip()
 
                 is_complete = False
                 current     = 0
                 goal_target = 0
-                text        = ""
 
-                # COUNT GOALS
+                # ---------- COUNT GOALS ----------
                 if gtype == "count":
                     goal_target = target or 0
 
@@ -155,7 +151,6 @@ class SummaryCog(commands.Cog):
                         """, (uid, w, goal_name)).fetchone()
                         current = r["value_total"] if r else 0
                         is_complete = current >= target
-                        text = f"{current}/{target}{unit_sfx}"
 
                     elif style == "weekly_final":
                         r = cur.execute("""
@@ -164,13 +159,13 @@ class SummaryCog(commands.Cog):
                         """, (uid, w, goal_name)).fetchone()
                         current = r["value"] if r else 0
                         is_complete = current >= target
-                        text = f"{current}/{target}{unit_sfx}"
 
-                    # Add to team totals
                     team_target_total += goal_target
                     team_current_total += current
 
-                # BOOLEAN GOALS
+                    bit = f"{current}/{target}{unit_sfx}"
+
+                # ---------- BOOLEAN GOALS ----------
                 elif gtype == "boolean":
                     r = cur.execute("""
                         SELECT done FROM booleans
@@ -178,19 +173,32 @@ class SummaryCog(commands.Cog):
                     """, (uid, w, goal_name)).fetchone()
                     done = bool(r and r["done"])
                     is_complete = done
-                    text = "done" if done else "not done"
 
-                    # Boolean counts as 1/1
                     goal_target = 1
                     current = 1 if done else 0
 
                     team_target_total += goal_target
                     team_current_total += current
 
-                status_emoji = "✅" if is_complete else "⬜"
-                lines.append(f"{status_emoji} `{goal_name}` — {text}")
+                    bit = ""  # emoji alone will indicate status
 
-        # Compute team totals
+                else:
+                    # Unknown type; skip safely
+                    continue
+
+                status_emoji = "✅" if is_complete else "⬜"
+
+                if bit:
+                    goal_bits.append(f"{status_emoji} {goal_name} {bit}")
+                else:
+                    goal_bits.append(f"{status_emoji} {goal_name}")
+
+            # If user actually had any goals, add a single compact line
+            if goal_bits:
+                line = f"**{display}**: " + " | ".join(goal_bits)
+                lines.append(line)
+
+        # --- Team totals ---
         if team_target_total > 0:
             progress_ratio = team_current_total / team_target_total
         else:
@@ -201,7 +209,7 @@ class SummaryCog(commands.Cog):
 
         lines.append("")
         lines.append(
-            f"**Team progress:** {team_current_total}/{team_target_total} total units ({progress_pct}%)"
+            f"\n**Team progress:** {team_current_total}/{team_target_total} ({progress_pct}%)"
         )
 
         footer = pick_humor_footer(progress_pct, remaining_units)
