@@ -138,7 +138,7 @@ class SummaryCog(commands.Cog):
                         parts.append(text)
 
                         # team totals
-                        team_current += val
+                        team_current += min(val, g["target"])
                         team_target += g["target"] or 0
 
                         if not complete:
@@ -161,7 +161,7 @@ class SummaryCog(commands.Cog):
                         parts.append(text)
 
                         # team totals
-                        team_current += val
+                        team_current += min(val, g["target"])
                         team_target += g["target"] or 0
 
                         if not complete:
