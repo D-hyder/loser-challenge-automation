@@ -15,7 +15,7 @@ def week_start():
     now = datetime.now(tz)
     return (now - timedelta(days=now.weekday())).date()
 
-def pick_humor_footer(progress_pct: int, remaining_units: int) -> str:
+def pick_humor_footer(progress_pct: int, remaining_units: int, team_risk: bool) -> str:
     """
     Deterministic humorous footer based on:
       - progress_pct (0–100)
@@ -37,7 +37,7 @@ def pick_humor_footer(progress_pct: int, remaining_units: int) -> str:
         remaining_text = f"{remaining_units} units left."
 
     # 100% done: same message for any day
-    if progress_pct >= 100:
+    if progress_pct >= 100 and not team_risk:
         return f"🎉 No wasabi biscuit this week — pack it up, Gordon Ramsay! ({remaining_text})"
 
     # ---------- EARLY WEEK: Monday–Tuesday ----------
@@ -85,138 +85,123 @@ class SummaryCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(
-        name="summary",
-        description="Show team progress for this week."
-    )
+    @app_commands.command(name="summary", description="Show the team progress for this week.")
     async def summary(self, interaction: discord.Interaction):
         conn = get_db(); cur = conn.cursor()
         w = str(week_start())
 
-        lines = [f"**Team Summary – Week of {w}**"]
+        ts = cur.execute("SELECT streak, best_streak FROM team_stats WHERE id=1").fetchone()
+        streak, best = (ts["streak"], ts["best_streak"]) if ts else (0, 0)
 
-        # Team-level totals (all treated as "units")
-        team_current_total = 0
-        team_target_total = 0
-
-        participants = cur.execute("""
-            SELECT DISTINCT user_id FROM goals_default
-        """).fetchall()
-
+        participants = cur.execute("SELECT * FROM participants WHERE active=1").fetchall()
         if not participants:
-            await interaction.response.send_message(
-                "No goals have been set yet.", ephemeral=True
-            )
+            await interaction.response.send_message("No active participants.", ephemeral=True)
             conn.close()
             return
 
-        for row in participants:
-            uid = row["user_id"]
-            guild = interaction.guild
-            member = guild.get_member(uid) if guild else None
-            display = member.display_name if member else f"User {uid}"
+        lines: List[str] = [
+            f"**Team Summary — Week of {w}**",
+            f"🏆 Team Streak: {streak} (Best: {best})",
+            ""
+        ]
+        team_risk = False
 
-            user_goals = cur.execute("""
-                SELECT name, type, target, log_style, COALESCE(unit,'') AS unit
-                FROM goals_default
-                WHERE user_id=?
-                ORDER BY name
-            """, (uid,)).fetchall()
+        team_current = 0  # sum of all current “units”
+        team_target = 0   # sum of all targets
 
-            if not user_goals:
+        for p in participants:
+            uid = p["user_id"]
+            goals = cur.execute("SELECT * FROM goals_default WHERE user_id=?", (uid,)).fetchall()
+            if not goals:
+                lines.append(f"<@{uid}>: No goals set ❌")
+                team_risk = True
                 continue
 
-            goal_bits: list[str] = []
+            parts: List[str] = []
+            for g in goals:
+                if g["type"] == "count":
+                    if g["log_style"] == "incremental":
+                        r = cur.execute(
+                            "SELECT value_total FROM progress WHERE user_id=? AND week_start=? AND name=?",
+                            (uid, w, g["name"])
+                        ).fetchone()
+                        val = r["value_total"] if r else 0
 
-            for g in user_goals:
-                goal_name = g["name"]
-                gtype     = g["type"]          # 'count' | 'boolean'
-                target    = g["target"]
-                style     = g["log_style"]     # 'incremental' | 'weekly_final'
-                unit      = g["unit"]
-                unit_sfx  = f" {unit}".rstrip()
+                        unit = (g["unit"] or "").strip() if "unit" in g.keys() else ""
+                        unit_suffix = f" {unit}" if unit else ""
 
-                is_complete = False
-                current     = 0
-                goal_target = 0
+                        complete = val >= g["target"]
+                        text = f"{g['name']} {val}/{g['target']}{unit_suffix}"
+                        if complete:
+                            text += " ✅"
 
-                # ---------- COUNT GOALS ----------
-                if gtype == "count":
-                    goal_target = target or 0
+                        parts.append(text)
 
-                    if style == "incremental":
-                        r = cur.execute("""
-                            SELECT value_total FROM progress
-                            WHERE user_id=? AND week_start=? AND name=?
-                        """, (uid, w, goal_name)).fetchone()
-                        current = r["value_total"] if r else 0
-                        is_complete = current >= target
+                        # team totals
+                        team_current += val
+                        team_target += g["target"] or 0
 
-                    elif style == "weekly_final":
-                        r = cur.execute("""
-                            SELECT value FROM finals
-                            WHERE user_id=? AND week_start=? AND name=?
-                        """, (uid, w, goal_name)).fetchone()
-                        current = r["value"] if r else 0
-                        is_complete = current >= target
+                        if not complete:
+                            team_risk = True
+                    else:
+                        r = cur.execute(
+                            "SELECT value FROM finals WHERE user_id=? AND week_start=? AND name=?",
+                            (uid, w, g["name"])
+                        ).fetchone()
+                        val = r["value"] if r else 0
 
-                    team_target_total += goal_target
-                    team_current_total += current
+                        unit = (g["unit"] or "").strip() if "unit" in g.keys() else ""
+                        unit_suffix = f" {unit}" if unit else ""
 
-                    bit = f"{current}/{target}{unit_sfx}"
+                        complete = val >= g["target"]
+                        text = f"{g['name']} final: {val}/{g['target']}{unit_suffix}"
+                        if complete:
+                            text += " ✅"
 
-                # ---------- BOOLEAN GOALS ----------
-                elif gtype == "boolean":
-                    r = cur.execute("""
-                        SELECT done FROM booleans
-                        WHERE user_id=? AND week_start=? AND name=?
-                    """, (uid, w, goal_name)).fetchone()
-                    done = bool(r and r["done"])
-                    is_complete = done
+                        parts.append(text)
 
-                    goal_target = 1
-                    current = 1 if done else 0
+                        # team totals
+                        team_current += val
+                        team_target += g["target"] or 0
 
-                    team_target_total += goal_target
-                    team_current_total += current
-
-                    bit = ""  # emoji alone will indicate status
-
+                        if not complete:
+                            team_risk = True
                 else:
-                    # Unknown type; skip safely
-                    continue
+                    r = cur.execute(
+                        "SELECT done FROM booleans WHERE user_id=? AND week_start=? AND name=?",
+                        (uid, w, g["name"])
+                    ).fetchone()
+                    ok = bool(r and r["done"])
+                    parts.append(f"{g['name']} {'✅' if ok else '❌'}")
 
-                status_emoji = "✅" if is_complete else "⬜"
+                    # booleans are 1/1 if done, 0/1 if not
+                    team_target += 1
+                    if ok:
+                        team_current += 1
+                    else:
+                        team_risk = True
 
-                if bit:
-                    goal_bits.append(f"{status_emoji} {goal_name} {bit}")
-                else:
-                    goal_bits.append(f"{status_emoji} {goal_name}")
 
-            # If user actually had any goals, add a single compact line
-            if goal_bits:
-                line = f"**{display}**: " + " | ".join(goal_bits)
-                lines.append(line)
+            lines.append(f"<@{uid}>: " + " | ".join(parts))
 
-        # --- Team totals ---
-        if team_target_total > 0:
-            progress_ratio = team_current_total / team_target_total
+        # ---- Team progress line ----
+        if team_target > 0:
+            progress_ratio = team_current / team_target
         else:
             progress_ratio = 0.0
 
         progress_pct = int(round(progress_ratio * 100))
-        remaining_units = max(0, team_target_total - team_current_total)
+        remaining_units = max(0, team_target - team_current)
 
-        lines.append("")
         lines.append(
-            f"\n**Team progress:** {team_current_total}/{team_target_total} ({progress_pct}%)"
+            f"\n**Team progress:** {team_current}/{team_target} ({progress_pct}%)"
         )
 
-        footer = pick_humor_footer(progress_pct, remaining_units)
-        lines.append(footer)
+        # ---- Dynamic humor / vibe footer ----
+        lines.append(pick_humor_footer(progress_pct, remaining_units, team_risk))
 
-        conn.close()
         await interaction.response.send_message("\n".join(lines))
+        conn.close()
 
     @app_commands.command(name="guide", description="Show Loser Challenge guide")
     async def guide(self, interaction: discord.Interaction):
