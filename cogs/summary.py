@@ -81,7 +81,7 @@ def pick_humor_footer(progress_pct: int, remaining_units: int) -> str:
     return f"{msg} ({remaining_text})"
 
 
-class GoalsCog(commands.Cog):
+class SummaryCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
