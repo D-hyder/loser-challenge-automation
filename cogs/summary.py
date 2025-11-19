@@ -22,7 +22,7 @@ def pick_humor_footer(progress_pct: int, remaining_units: int, team_risk: bool) 
       - remaining_units (how many 'units' of goals are left overall)
       - day of week (Mon–Sun)
     """
-    weekday = datetime.now().weekday()  # Monday=0, Sunday=6
+    weekday = datetime.now(tz).weekday()  # Monday=0, Sunday=6
 
     # Clamp values
     progress_pct = max(0, min(progress_pct, 100))
