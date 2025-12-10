@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from database import get_db
-from config import DATABASE_PATH
+from config import LOSER_DATA_PATH
 from scheduler import post_weekly_message, evaluate_week, reset_week, backup_now
 
 class AdminCog(commands.Cog):
