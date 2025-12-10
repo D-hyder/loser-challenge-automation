@@ -102,7 +102,7 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="backup", description="Save the database now (manual snapshot).")
     @app_commands.checks.has_permissions(administrator=True)
     async def backup(self, interaction: discord.Interaction):
-        p = Path(DATABASE_PATH)
+        p = Path(LOSER_DATA_PATH)
         p.parent.mkdir(parents=True, exist_ok=True)
         backup_name = p.parent / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         try:
@@ -115,7 +115,7 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="listbackups", description="List available DB backups.")
     @app_commands.checks.has_permissions(administrator=True)
     async def listbackups(self, interaction: discord.Interaction):
-        base = Path(DATABASE_PATH).parent
+        base = Path(LOSER_DATA_PATH).parent
         backups = sorted(base.glob("backup_*.db"), reverse=True)[:20]
         if not backups:
             await interaction.response.send_message("No backups found.", ephemeral=True)
@@ -127,7 +127,7 @@ class AdminCog(commands.Cog):
     @app_commands.describe(backup_filename="Filename shown in /listbackups")
     @app_commands.checks.has_permissions(administrator=True)
     async def restore(self, interaction: discord.Interaction, backup_filename: str):
-        base = Path(DATABASE_PATH).parent
+        base = Path(LOSER_DATA_PATH).parent
 
         # basic filename guard
         if not (backup_filename.startswith("backup_") and backup_filename.endswith(".db")):
@@ -139,7 +139,7 @@ class AdminCog(commands.Cog):
             await interaction.response.send_message("❌ Backup not found. Use `/listbackups`.", ephemeral=True)
             return
 
-        cur_db = Path(DATABASE_PATH)
+        cur_db = Path(LOSER_DATA_PATH)
         safety = base / f"pre_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
 
         try:
