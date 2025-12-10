@@ -7,7 +7,7 @@ import pytz
 import discord
 
 from database import get_db
-from config import TIMEZONE, CHALLENGE_CHANNEL_ID, LOSER_ROLE_ID, DATABASE_PATH
+from config import TIMEZONE, CHALLENGE_CHANNEL_ID, LOSER_ROLE_ID, LOSER_DATA_PATH
 
 tz = pytz.timezone(TIMEZONE)
 
@@ -84,7 +84,7 @@ async def post_weekly_message(bot: discord.Client):
 
 async def backup_now(bot: discord.Client):
     """Create a timestamped DB backup before evaluation."""
-    p = Path(DATABASE_PATH)
+    p = Path(LOSER_DATA_PATH)
     p.parent.mkdir(parents=True, exist_ok=True)
     backup_name = p.parent / f"backup_{datetime.now(tz).strftime('%Y%m%d_%H%M%S')}.db"
     copyfile(p, backup_name)
