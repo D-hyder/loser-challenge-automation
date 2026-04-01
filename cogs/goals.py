@@ -1,32 +1,27 @@
-# cogs/goals.py — discord.py 2.x (app_commands) version
+# cogs/goals.py
 from typing import Optional, Literal
-from datetime import datetime, timedelta, timezone
-import pytz
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from database import get_db
-from config import TIMEZONE
+from utils import week_start
 
-tz = pytz.timezone(TIMEZONE)
-
-def week_start():
-    now = datetime.now(tz)
-    return (now - timedelta(days=now.weekday())).date()
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 class GoalsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ---------- Goal Management ----------
+    # ── Goal Management ───────────────────────────────────────────────────────
 
     @app_commands.command(
         name="setdefault",
-        description="Add, remove, or list your default goals."
+        description="Add, remove, or list your default goals.",
     )
     @app_commands.describe(
         action="What do you want to do? (add/remove/list)",
@@ -34,21 +29,21 @@ class GoalsCog(commands.Cog):
         goal_type="For add: count = numeric, boolean = done/not-done",
         target="For count goals: how many per week (e.g., 3, 7, 10)",
         log_style="For count goals: incremental = /loser, weekly_final = /final",
-        unit="Optional unit label (sessions, days, miles, pages...)"
+        unit="Optional unit label (sessions, days, miles, pages...)",
     )
     @app_commands.choices(
         action=[
             app_commands.Choice(name="Add / update goal", value="add"),
-            app_commands.Choice(name="Remove goal", value="remove"),
-            app_commands.Choice(name="List my goals", value="list"),
+            app_commands.Choice(name="Remove goal",       value="remove"),
+            app_commands.Choice(name="List my goals",     value="list"),
         ],
         goal_type=[
-            app_commands.Choice(name="Count (numeric)", value="count"),
+            app_commands.Choice(name="Count (numeric)",         value="count"),
             app_commands.Choice(name="Boolean (done/not done)", value="boolean"),
         ],
         log_style=[
-            app_commands.Choice(name="Incremental (use /loser)", value="incremental"),
-            app_commands.Choice(name="Weekly final (use /final)", value="weekly_final"),
+            app_commands.Choice(name="Incremental (use /loser)",    value="incremental"),
+            app_commands.Choice(name="Weekly final (use /final)",   value="weekly_final"),
         ],
     )
     async def setdefault(
@@ -61,17 +56,19 @@ class GoalsCog(commands.Cog):
         log_style: Optional[app_commands.Choice[str]] = None,
         unit: Optional[str] = None,
     ):
+        gid = interaction.guild_id
         uid = interaction.user.id
-        conn = get_db(); cur = conn.cursor()
+        conn = get_db()
+        cur  = conn.cursor()
 
-        # ---- LIST ----
+        # ── LIST ──────────────────────────────────────────────────────────────
         if action.value == "list":
-            rows = cur.execute(
+            cur.execute(
                 "SELECT name, type, target, log_style, COALESCE(unit,'') AS unit "
-                "FROM goals_default WHERE user_id=? ORDER BY name",
-                (uid,)
-            ).fetchall()
-
+                "FROM goals_default WHERE guild_id=%s AND user_id=%s ORDER BY name",
+                (gid, uid),
+            )
+            rows = cur.fetchall()
             if not rows:
                 await interaction.response.send_message(
                     "You have no default goals set.", ephemeral=True
@@ -80,101 +77,93 @@ class GoalsCog(commands.Cog):
 
             lines = ["**Your default goals:**"]
             for r in rows:
-                t = r["type"]
-                style = r["log_style"] or ""
                 unit_label = f" {r['unit']}".rstrip()
-
-                if t == "count":
+                if r["type"] == "count":
                     lines.append(
                         f"• `{r['name']}` — count, target **{r['target']}**{unit_label} "
-                        f"({style})"
+                        f"({r['log_style']})"
                     )
                 else:
-                    lines.append(
-                        f"• `{r['name']}` — boolean (uses `/complete`)"
-                    )
+                    lines.append(f"• `{r['name']}` — boolean (uses `/complete`)")
 
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
             conn.close(); return
 
-        # ---- REMOVE ----
+        # ── REMOVE ────────────────────────────────────────────────────────────
         if action.value == "remove":
             if not name:
                 await interaction.response.send_message(
-                    "❌ You must provide `name` to remove a goal.",
-                    ephemeral=True
+                    "❌ You must provide `name` to remove a goal.", ephemeral=True
                 )
                 conn.close(); return
 
             cur.execute(
-                "DELETE FROM goals_default WHERE user_id=? AND name=?",
-                (uid, name)
+                "DELETE FROM goals_default WHERE guild_id=%s AND user_id=%s AND name=%s",
+                (gid, uid, name),
             )
             conn.commit()
             await interaction.response.send_message(
-                f"🗑️ Removed default goal `{name}` (if it existed).",
-                ephemeral=True
+                f"🗑️ Removed default goal `{name}` (if it existed).", ephemeral=True
             )
             conn.close(); return
 
-        # ---- ADD / UPDATE ----
+        # ── ADD / UPDATE ──────────────────────────────────────────────────────
         if action.value == "add":
             if not name:
                 await interaction.response.send_message(
-                    "❌ You must provide `name` when adding a goal.",
-                    ephemeral=True
+                    "❌ You must provide `name` when adding a goal.", ephemeral=True
                 )
                 conn.close(); return
 
             if not goal_type:
                 await interaction.response.send_message(
                     "❌ You must choose `goal_type` (count or boolean) when adding a goal.",
-                    ephemeral=True
+                    ephemeral=True,
                 )
                 conn.close(); return
 
-            gtype = goal_type.value  # 'count' | 'boolean'
+            gtype = goal_type.value
 
-            # BOOLEAN GOALS: force weekly_final and ignore target/log_style/unit
             if gtype == "boolean":
-                # We can store target NULL or 1; it doesn't matter for behavior.
-                cur.execute("""
-                    INSERT OR REPLACE INTO goals_default (user_id, name, type, target, log_style, unit)
-                    VALUES (?, ?, 'boolean', NULL, 'weekly_final', NULL)
-                """, (uid, name))
+                cur.execute(
+                    """
+                    INSERT INTO goals_default (guild_id, user_id, name, type, target, log_style, unit)
+                    VALUES (%s, %s, %s, 'boolean', NULL, 'weekly_final', NULL)
+                    ON CONFLICT (guild_id, user_id, name) DO UPDATE SET
+                        type='boolean', target=NULL, log_style='weekly_final', unit=NULL
+                    """,
+                    (gid, uid, name),
+                )
                 conn.commit()
                 await interaction.response.send_message(
                     f"✅ Saved boolean goal `{name}`.\n"
                     f"• Use `/complete name:{name}` to mark it done each week.\n"
                     f"• Use `/undo name:{name}` to reverse it.",
-                    ephemeral=True
+                    ephemeral=True,
                 )
                 conn.close(); return
 
-            # COUNT GOALS
             if gtype == "count":
                 if target is None or target <= 0:
                     await interaction.response.send_message(
                         "❌ Count goals need a positive `target` (e.g., 3, 5, 7).",
-                        ephemeral=True
+                        ephemeral=True,
                     )
                     conn.close(); return
 
-                # Determine style: default to incremental if none provided
                 style_value = log_style.value if log_style else "incremental"
-                if style_value not in ("incremental", "weekly_final"):
-                    await interaction.response.send_message(
-                        "❌ Invalid log_style for count goal. Choose incremental or weekly_final.",
-                        ephemeral=True
-                    )
-                    conn.close(); return
+                unit_value  = unit.strip() if unit else None
 
-                unit_value = unit.strip() if unit else None
-
-                cur.execute("""
-                    INSERT OR REPLACE INTO goals_default (user_id, name, type, target, log_style, unit)
-                    VALUES (?, ?, 'count', ?, ?, ?)
-                """, (uid, name, target, style_value, unit_value))
+                cur.execute(
+                    """
+                    INSERT INTO goals_default (guild_id, user_id, name, type, target, log_style, unit)
+                    VALUES (%s, %s, %s, 'count', %s, %s, %s)
+                    ON CONFLICT (guild_id, user_id, name) DO UPDATE SET
+                        type='count', target=EXCLUDED.target,
+                        log_style=EXCLUDED.log_style, unit=EXCLUDED.unit
+                    """,
+                    (gid, uid, name, target, style_value, unit_value),
+                )
                 conn.commit()
 
                 if style_value == "incremental":
@@ -189,56 +178,70 @@ class GoalsCog(commands.Cog):
                         f"{(' ' + unit_value) if unit_value else ''} per week "
                         f"(weekly-final — use `/final`)."
                     )
-
                 await interaction.response.send_message(text, ephemeral=True)
                 conn.close(); return
 
-        # If something weird slips through:
         await interaction.response.send_message(
             "❌ Unsupported `action` for /setdefault.", ephemeral=True
         )
         conn.close()
 
-    # ---------- Weekly override (simple) ----------
-    @app_commands.command(name="setweek", description="Override one of your goals for this week only.")
+    # ── Weekly override ───────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="setweek",
+        description="Override one of your goals for this week only.",
+    )
     @app_commands.describe(
         name="Existing goal name",
         target="New target for this week (optional)",
-        log_style="Override style for this week (optional)"
+        log_style="Override style for this week (optional)",
     )
     async def setweek(
         self,
         interaction: discord.Interaction,
         name: str,
         target: Optional[int] = None,
-        log_style: Optional[Literal["incremental", "weekly_final"]] = None
+        log_style: Optional[Literal["incremental", "weekly_final"]] = None,
     ):
-        conn = get_db(); cur = conn.cursor()
+        gid = interaction.guild_id
         uid = interaction.user.id
-        g = cur.execute("SELECT * FROM goals_default WHERE user_id=? AND name=?", (uid, name.lower())).fetchone()
+        conn = get_db(); cur = conn.cursor()
+
+        cur.execute(
+            "SELECT * FROM goals_default WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (gid, uid, name.lower()),
+        )
+        g = cur.fetchone()
         if not g:
-            await interaction.response.send_message("❌ You don't have a goal by that name.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ You don't have a goal by that name.", ephemeral=True
+            )
             conn.close(); return
-        cur.execute("""
-            UPDATE goals_default SET target=?, log_style=? WHERE user_id=? AND name=?
-        """, (target or g["target"], (log_style or g["log_style"]), uid, name.lower()))
+
+        cur.execute(
+            "UPDATE goals_default SET target=%s, log_style=%s "
+            "WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (target or g["target"], log_style or g["log_style"], gid, uid, name.lower()),
+        )
         conn.commit(); conn.close()
         await interaction.response.send_message(
-            f"✅ This week: `{name}` → target={target or g['target']}, style={log_style or g['log_style']}",
-            ephemeral=True
+            f"✅ This week: `{name}` → target={target or g['target']}, "
+            f"style={log_style or g['log_style']}",
+            ephemeral=True,
         )
 
-    # ---------- Logging ----------
+    # ── Logging ───────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="loser",
-        description="Log progress: incremental-style goals (amount/set_to)."
+        description="Log progress: incremental-style goals (amount/set_to).",
     )
     @app_commands.describe(
         name="Your goal name (as saved)",
-        amount="Add this number (e.g., +1 (default))",
+        amount="Add this number (default +1)",
         set_to="Set your running total to this number",
-        note="Optional note (shown in /history and /me)"
+        note="Optional note (shown in /history and /me)",
     )
     async def loser(
         self,
@@ -248,108 +251,111 @@ class GoalsCog(commands.Cog):
         set_to: Optional[int] = None,
         note: Optional[str] = None,
     ):
+        gid = interaction.guild_id
         uid = interaction.user.id
-        w = str(week_start())
+        w   = str(week_start())
         conn = get_db(); cur = conn.cursor()
 
-        # Look up goal definition
-        g = cur.execute(
+        cur.execute(
             "SELECT name, type, target, log_style, COALESCE(unit,'') AS unit "
-            "FROM goals_default WHERE user_id=? AND name=?",
-            (uid, name)
-        ).fetchone()
-
+            "FROM goals_default WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (gid, uid, name),
+        )
+        g = cur.fetchone()
         if not g:
             await interaction.response.send_message(
                 f"❌ Goal `{name}` not found. Use `/setdefault action:list`.",
-                ephemeral=True  # keep errors private
+                ephemeral=True,
             )
             conn.close(); return
 
-        goal_name = g["name"]
-        gtype     = g["type"]            # 'count' | 'boolean'
-        style     = g["log_style"]       # 'incremental' | 'weekly_final'
-        target    = g["target"]
-        unit      = g["unit"]
-        unit_sfx  = f" {unit}".rstrip()
+        goal_name = g["name"]; gtype = g["type"]; style = g["log_style"]
+        target = g["target"]; unit_sfx = f" {g['unit']}".rstrip()
 
-        # Boolean goals: use /complete instead
         if gtype == "boolean":
             await interaction.response.send_message(
-                f"ℹ️ `{goal_name}` is a boolean goal. Use `/complete name:{goal_name}` (or `/undo`).",
-                ephemeral=True
+                f"ℹ️ `{goal_name}` is a boolean goal. Use `/complete name:{goal_name}`.",
+                ephemeral=True,
             )
             conn.close(); return
-        
-        # Weekly-final count goals: use /final instead
+
         if gtype == "count" and style == "weekly_final":
             await interaction.response.send_message(
                 f"ℹ️ `{goal_name}` is a weekly-final goal. Use `/final name:{goal_name} value:<number>`.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
-        # COUNT + INCREMENTAL
-        if gtype == "count" and style == "incremental":
-            if amount is None and set_to is None:
-                await interaction.response.send_message(
-                    "❌ Incremental goal needs `amount` (add) or `set_to` (overwrite total).",
-                    ephemeral=True
-                )
-                conn.close(); return
+        # Count + incremental
+        cur.execute(
+            "SELECT value_total FROM progress "
+            "WHERE guild_id=%s AND user_id=%s AND week_start=%s AND name=%s",
+            (gid, uid, w, goal_name),
+        )
+        r = cur.fetchone()
+        current = r["value_total"] if r else 0
 
-            # current total
-            r = cur.execute(
-                "SELECT value_total FROM progress WHERE user_id=? AND week_start=? AND name=?",
-                (uid, w, goal_name)
-            ).fetchone()
-            current = r["value_total"] if r else 0
+        if set_to is not None:
+            new_total = max(0, int(set_to))
+            cur.execute(
+                """
+                INSERT INTO progress (guild_id, user_id, week_start, name, value_total)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (guild_id, user_id, week_start, name)
+                DO UPDATE SET value_total=EXCLUDED.value_total
+                """,
+                (gid, uid, w, goal_name, new_total),
+            )
+            cur.execute(
+                """
+                INSERT INTO logs (guild_id, user_id, week_start, name, kind, delta, set_to, note, ts_utc)
+                VALUES (%s, %s, %s, %s, 'incremental', NULL, %s, %s, %s)
+                """,
+                (gid, uid, w, goal_name, new_total, note, _utc_now_iso()),
+            )
+            conn.commit()
+            msg = (
+                f"**{interaction.user.display_name}** set `{goal_name}` → "
+                f"**{new_total}/{target}**{unit_sfx} (incremental)."
+            )
+        else:
+            add = int(amount)  # type: ignore
+            new_total = max(0, current + add)
+            cur.execute(
+                """
+                INSERT INTO progress (guild_id, user_id, week_start, name, value_total)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (guild_id, user_id, week_start, name)
+                DO UPDATE SET value_total=EXCLUDED.value_total
+                """,
+                (gid, uid, w, goal_name, new_total),
+            )
+            cur.execute(
+                """
+                INSERT INTO logs (guild_id, user_id, week_start, name, kind, delta, set_to, note, ts_utc)
+                VALUES (%s, %s, %s, %s, 'incremental', %s, NULL, %s, %s)
+                """,
+                (gid, uid, w, goal_name, add, note, _utc_now_iso()),
+            )
+            conn.commit()
+            msg = (
+                f"**{interaction.user.display_name}** updated `{goal_name}`: +{add} → "
+                f"**{new_total}/{target}**{unit_sfx} (incremental)."
+            )
 
-            if set_to is not None:
-                new_total = max(0, int(set_to))
-                cur.execute("""
-                    INSERT OR REPLACE INTO progress (user_id, week_start, name, value_total)
-                    VALUES (?, ?, ?, ?)
-                """, (uid, w, goal_name, new_total))
-                cur.execute("""
-                    INSERT INTO logs (user_id, week_start, name, kind, delta, set_to, note, ts_utc)
-                    VALUES (?, ?, ?, 'incremental', NULL, ?, ?, ?)
-                """, (uid, w, goal_name, new_total, note, _utc_now_iso()))
-                conn.commit()
-                msg = (f"**{interaction.user.display_name}** set `{goal_name}` → "
-                    f"**{new_total}/{target}**{unit_sfx} (incremental).")
-            else:
-                add = int(amount) # type: ignore
-                new_total = max(0, current + add)
-                cur.execute("""
-                    INSERT OR REPLACE INTO progress (user_id, week_start, name, value_total)
-                    VALUES (?, ?, ?, ?)
-                """, (uid, w, goal_name, new_total))
-                cur.execute("""
-                    INSERT INTO logs (user_id, week_start, name, kind, delta, set_to, note, ts_utc)
-                    VALUES (?, ?, ?, 'incremental', ?, NULL, ?, ?)
-                """, (uid, w, goal_name, add, note, _utc_now_iso()))
-                conn.commit()
-                msg = (f"**{interaction.user.display_name}** updated `{goal_name}`: +{add} → "
-                    f"**{new_total}/{target}**{unit_sfx} (incremental).")
-
-            if note:
-                msg += f"  _{note}_"
-            await interaction.response.send_message(msg)  # PUBLIC
-            conn.close(); return
-
-        # fallback
-        await interaction.response.send_message("❌ Unsupported goal configuration.", ephemeral=True)
+        if note:
+            msg += f"  _{note}_"
+        await interaction.response.send_message(msg)
         conn.close()
 
     @app_commands.command(
         name="final",
-        description="Set the final weekly value for a weekly-final count goal."
+        description="Set the final weekly value for a weekly-final count goal.",
     )
     @app_commands.describe(
         name="Your weekly-final goal name (exact as saved)",
         value="Your final number for this week (e.g., 7)",
-        note="Optional note (shown in /history and /me)"
+        note="Optional note (shown in /history and /me)",
     )
     async def final(
         self,
@@ -358,34 +364,31 @@ class GoalsCog(commands.Cog):
         value: int,
         note: Optional[str] = None,
     ):
+        gid = interaction.guild_id
         uid = interaction.user.id
-        w = str(week_start())
+        w   = str(week_start())
         conn = get_db(); cur = conn.cursor()
 
-        g = cur.execute(
+        cur.execute(
             "SELECT name, type, target, log_style, COALESCE(unit,'') AS unit "
-            "FROM goals_default WHERE user_id=? AND name=?",
-            (uid, name)
-        ).fetchone()
-
+            "FROM goals_default WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (gid, uid, name),
+        )
+        g = cur.fetchone()
         if not g:
             await interaction.response.send_message(
                 f"❌ Goal `{name}` not found. Use `/setdefault action:list`.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
-        goal_name = g["name"]
-        gtype     = g["type"]          # 'count' | 'boolean'
-        style     = g["log_style"]     # should be 'weekly_final'
-        target    = g["target"]
-        unit      = g["unit"]
-        unit_sfx  = f" {unit}".rstrip()
+        goal_name = g["name"]; gtype = g["type"]; style = g["log_style"]
+        target = g["target"]; unit_sfx = f" {g['unit']}".rstrip()
 
         if gtype != "count":
             await interaction.response.send_message(
                 f"ℹ️ `{goal_name}` is not a count goal. Use `/complete` for boolean goals.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
@@ -393,24 +396,27 @@ class GoalsCog(commands.Cog):
             await interaction.response.send_message(
                 f"ℹ️ `{goal_name}` is not configured as weekly-final. "
                 f"Use `/loser` for incremental updates instead.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
         final_val = max(0, int(value))
-
-        cur.execute("""
-            INSERT OR REPLACE INTO finals (user_id, week_start, name, value)
-            VALUES (?, ?, ?, ?)
-        """, (uid, w, goal_name, final_val))
-
-        cur.execute("""
-            INSERT INTO logs (user_id, week_start, name, kind, delta, set_to, note, ts_utc)
-            VALUES (?, ?, ?, 'weekly_final', NULL, ?, ?, ?)
-        """, (uid, w, goal_name, final_val, note, _utc_now_iso()))
-
-        conn.commit()
-        conn.close()
+        cur.execute(
+            """
+            INSERT INTO finals (guild_id, user_id, week_start, name, value)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id, week_start, name) DO UPDATE SET value=EXCLUDED.value
+            """,
+            (gid, uid, w, goal_name, final_val),
+        )
+        cur.execute(
+            """
+            INSERT INTO logs (guild_id, user_id, week_start, name, kind, delta, set_to, note, ts_utc)
+            VALUES (%s, %s, %s, %s, 'weekly_final', NULL, %s, %s, %s)
+            """,
+            (gid, uid, w, goal_name, final_val, note, _utc_now_iso()),
+        )
+        conn.commit(); conn.close()
 
         msg = (
             f"**{interaction.user.display_name}** set weekly-final `{goal_name}` = "
@@ -418,17 +424,15 @@ class GoalsCog(commands.Cog):
         )
         if note:
             msg += f"  _{note}_"
-
-        # PUBLIC
         await interaction.response.send_message(msg)
 
     @app_commands.command(
         name="complete",
-        description="Mark a boolean goal as complete for this week."
+        description="Mark a boolean goal as complete for this week.",
     )
     @app_commands.describe(
         name="Your boolean goal name (exact as saved)",
-        note="Optional note (shown in /history and /me)"
+        note="Optional note (shown in /history and /me)",
     )
     async def complete(
         self,
@@ -436,124 +440,119 @@ class GoalsCog(commands.Cog):
         name: str,
         note: Optional[str] = None,
     ):
+        gid = interaction.guild_id
         uid = interaction.user.id
-        w = str(week_start())
+        w   = str(week_start())
         conn = get_db(); cur = conn.cursor()
 
-        g = cur.execute(
-            "SELECT name, type, log_style FROM goals_default WHERE user_id=? AND name=?",
-            (uid, name)
-        ).fetchone()
-
+        cur.execute(
+            "SELECT name, type FROM goals_default WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (gid, uid, name),
+        )
+        g = cur.fetchone()
         if not g:
             await interaction.response.send_message(
                 f"❌ Goal `{name}` not found. Use `/setdefault action:list`.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
         goal_name = g["name"]
-        gtype     = g["type"]
-
-        if gtype != "boolean":
+        if g["type"] != "boolean":
             await interaction.response.send_message(
-                f"ℹ️ `{goal_name}` is not a boolean goal. Use `/loser` or `/final` for count goals.",
-                ephemeral=True
+                f"ℹ️ `{goal_name}` is not a boolean goal. Use `/loser` or `/final`.",
+                ephemeral=True,
             )
             conn.close(); return
 
-        # mark as done
-        cur.execute("""
-            INSERT OR REPLACE INTO booleans (user_id, week_start, name, done)
-            VALUES (?, ?, ?, 1)
-        """, (uid, w, goal_name))
-
-        cur.execute("""
-            INSERT INTO logs (user_id, week_start, name, kind, delta, set_to, note, ts_utc)
-            VALUES (?, ?, ?, 'boolean', NULL, 1, ?, ?)
-        """, (uid, w, goal_name, note, _utc_now_iso()))
-
-        conn.commit()
-        conn.close()
+        cur.execute(
+            """
+            INSERT INTO booleans (guild_id, user_id, week_start, name, done)
+            VALUES (%s, %s, %s, %s, 1)
+            ON CONFLICT (guild_id, user_id, week_start, name) DO UPDATE SET done=1
+            """,
+            (gid, uid, w, goal_name),
+        )
+        cur.execute(
+            """
+            INSERT INTO logs (guild_id, user_id, week_start, name, kind, delta, set_to, note, ts_utc)
+            VALUES (%s, %s, %s, %s, 'boolean', NULL, 1, %s, %s)
+            """,
+            (gid, uid, w, goal_name, note, _utc_now_iso()),
+        )
+        conn.commit(); conn.close()
 
         msg = f"**{interaction.user.display_name}** completed boolean goal `{goal_name}` ✅."
         if note:
             msg += f"  _{note}_"
-
-        # PUBLIC
         await interaction.response.send_message(msg)
-
 
     @app_commands.command(
         name="undo",
-        description="Undo completion of a boolean goal for this week."
+        description="Undo completion of a boolean goal for this week.",
     )
-    @app_commands.describe(
-        name="Your boolean goal name (exact as saved)"
-    )
-    async def undo(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-    ):
+    @app_commands.describe(name="Your boolean goal name (exact as saved)")
+    async def undo(self, interaction: discord.Interaction, name: str):
+        gid = interaction.guild_id
         uid = interaction.user.id
-        w = str(week_start())
+        w   = str(week_start())
         conn = get_db(); cur = conn.cursor()
 
-        g = cur.execute(
-            "SELECT name, type FROM goals_default WHERE user_id=? AND name=?",
-            (uid, name)
-        ).fetchone()
-
+        cur.execute(
+            "SELECT name, type FROM goals_default WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (gid, uid, name),
+        )
+        g = cur.fetchone()
         if not g:
             await interaction.response.send_message(
                 f"❌ Goal `{name}` not found. Use `/setdefault action:list`.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
         goal_name = g["name"]
-        gtype     = g["type"]
-
-        if gtype != "boolean":
+        if g["type"] != "boolean":
             await interaction.response.send_message(
                 f"ℹ️ `{goal_name}` is not a boolean goal. `/undo` only applies to boolean goals.",
-                ephemeral=True
+                ephemeral=True,
             )
             conn.close(); return
 
-        # delete completion
-        cur.execute("""
-            DELETE FROM booleans
-            WHERE user_id=? AND week_start=? AND name=?
-        """, (uid, w, goal_name))
-
-        cur.execute("""
-            INSERT INTO logs (user_id, week_start, name, kind, delta, set_to, note, ts_utc)
-            VALUES (?, ?, ?, 'undo', NULL, NULL, NULL, ?)
-        """, (uid, w, goal_name, _utc_now_iso()))
-
-        conn.commit()
-        conn.close()
-
-        # PUBLIC
+        cur.execute(
+            "DELETE FROM booleans WHERE guild_id=%s AND user_id=%s AND week_start=%s AND name=%s",
+            (gid, uid, w, goal_name),
+        )
+        cur.execute(
+            """
+            INSERT INTO logs (guild_id, user_id, week_start, name, kind, delta, set_to, note, ts_utc)
+            VALUES (%s, %s, %s, %s, 'undo', NULL, NULL, NULL, %s)
+            """,
+            (gid, uid, w, goal_name, _utc_now_iso()),
+        )
+        conn.commit(); conn.close()
         await interaction.response.send_message(
             f"**{interaction.user.display_name}** undid completion for `{goal_name}` ↩️."
         )
 
+    # ── Personal progress ─────────────────────────────────────────────────────
 
-    # ---------- Personal summary/history ----------
-
-    @app_commands.command(name="me", description="Show your goals and current progress for this week.")
+    @app_commands.command(
+        name="me",
+        description="Show your goals and current progress for this week.",
+    )
     async def me(self, interaction: discord.Interaction):
+        gid = interaction.guild_id
+        uid = interaction.user.id
+        w   = str(week_start())
         conn = get_db(); cur = conn.cursor()
-        uid = interaction.user.id; w = str(week_start())
 
-        goals = cur.execute("SELECT * FROM goals_default WHERE user_id=?", (uid,)).fetchall()
+        cur.execute(
+            "SELECT * FROM goals_default WHERE guild_id=%s AND user_id=%s", (gid, uid)
+        )
+        goals = cur.fetchall()
         if not goals:
             await interaction.response.send_message(
-                "You have no goals set. Use `/setdefault action:add ...`",
-                ephemeral=True
+                "You have no goals set. Use `/setdefault action:add ...`", ephemeral=True
             )
             conn.close(); return
 
@@ -561,90 +560,103 @@ class GoalsCog(commands.Cog):
         for g in goals:
             if g["type"] == "count":
                 if g["log_style"] == "incremental":
-                    r = cur.execute("SELECT value_total FROM progress WHERE user_id=? AND week_start=? AND name=?", (uid, w, g["name"])).fetchone()
-                    val = r["value_total"] if r else 0
-
-                    # ✅ Fetch last note (incremental)
-                    rnote = cur.execute("""
-                        SELECT note FROM logs
-                        WHERE user_id=? AND week_start=? AND name=? AND note IS NOT NULL AND note <> ''
-                        ORDER BY id DESC LIMIT 1
-                    """, (uid, w, g["name"].lower())).fetchone()
+                    cur.execute(
+                        "SELECT value_total FROM progress "
+                        "WHERE guild_id=%s AND user_id=%s AND week_start=%s AND name=%s",
+                        (gid, uid, w, g["name"]),
+                    )
+                    r = cur.fetchone(); val = r["value_total"] if r else 0
+                    cur.execute(
+                        "SELECT note FROM logs WHERE guild_id=%s AND user_id=%s "
+                        "AND week_start=%s AND name=%s AND note IS NOT NULL AND note <> '' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (gid, uid, w, g["name"].lower()),
+                    )
+                    rnote = cur.fetchone()
                     suffix = f" _(Last note: {rnote['note']})_" if rnote else ""
-
                     lines.append(f"• {g['name']} – {val}/{g['target']} (incremental){suffix}")
-
                 else:
-                    r = cur.execute("SELECT value FROM finals WHERE user_id=? AND week_start=? AND name=?", (uid, w, g["name"])).fetchone()
-                    val = r["value"] if r else 0
-
-                    # ✅ Fetch last note (final)
-                    rnote = cur.execute("""
-                        SELECT note FROM logs
-                        WHERE user_id=? AND week_start=? AND name=? AND note IS NOT NULL AND note <> ''
-                        ORDER BY id DESC LIMIT 1
-                    """, (uid, w, g["name"].lower())).fetchone()
+                    cur.execute(
+                        "SELECT value FROM finals "
+                        "WHERE guild_id=%s AND user_id=%s AND week_start=%s AND name=%s",
+                        (gid, uid, w, g["name"]),
+                    )
+                    r = cur.fetchone(); val = r["value"] if r else 0
+                    cur.execute(
+                        "SELECT note FROM logs WHERE guild_id=%s AND user_id=%s "
+                        "AND week_start=%s AND name=%s AND note IS NOT NULL AND note <> '' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (gid, uid, w, g["name"].lower()),
+                    )
+                    rnote = cur.fetchone()
                     suffix = f" _(Last note: {rnote['note']})_" if rnote else ""
-
                     lines.append(f"• {g['name']} – final: {val}/{g['target']}{suffix}")
-
             else:
-                r = cur.execute("SELECT done FROM booleans WHERE user_id=? AND week_start=? AND name=?", (uid, w, g["name"])).fetchone()
-                done = bool(r and r["done"])
-
-                # ✅ Fetch last note (boolean)
-                rnote = cur.execute("""
-                    SELECT note FROM logs
-                    WHERE user_id=? AND week_start=? AND name=? AND note IS NOT NULL AND note <> ''
-                    ORDER BY id DESC LIMIT 1
-                """, (uid, w, g["name"].lower())).fetchone()
+                cur.execute(
+                    "SELECT done FROM booleans "
+                    "WHERE guild_id=%s AND user_id=%s AND week_start=%s AND name=%s",
+                    (gid, uid, w, g["name"]),
+                )
+                r = cur.fetchone(); done = bool(r and r["done"])
+                cur.execute(
+                    "SELECT note FROM logs WHERE guild_id=%s AND user_id=%s "
+                    "AND week_start=%s AND name=%s AND note IS NOT NULL AND note <> '' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (gid, uid, w, g["name"].lower()),
+                )
+                rnote = cur.fetchone()
                 suffix = f" _(Last note: {rnote['note']})_" if rnote else ""
-
                 lines.append(f"• {g['name']} – {'✅' if done else '❌'}{suffix}")
-
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
         conn.close()
 
-    @app_commands.command(name="history", description="Show your log history for this week (with notes).")
+    @app_commands.command(
+        name="history",
+        description="Show your log history for this week (with notes).",
+    )
     @app_commands.describe(
         name="Filter by goal name (optional)",
-        limit="Max entries to show (default 10, max 50)"
+        limit="Max entries to show (default 10, max 50)",
     )
-    async def history(self, interaction: discord.Interaction, name: Optional[str] = None, limit: Optional[int] = 10):
-        conn = get_db(); cur = conn.cursor()
+    async def history(
+        self,
+        interaction: discord.Interaction,
+        name: Optional[str] = None,
+        limit: Optional[int] = 10,
+    ):
+        gid = interaction.guild_id
         uid = interaction.user.id
-        w = str(week_start())
+        w   = str(week_start())
         lim = max(1, min(limit or 10, 50))
+        conn = get_db(); cur = conn.cursor()
 
         if name:
-            rows = cur.execute("""
-                SELECT name, kind, delta, set_to, note, ts_utc
-                FROM logs
-                WHERE user_id=? AND week_start=? AND name=?
-                ORDER BY id DESC
-                LIMIT ?
-            """, (uid, w, name.lower(), lim)).fetchall()
+            cur.execute(
+                "SELECT name, kind, delta, set_to, note, ts_utc FROM logs "
+                "WHERE guild_id=%s AND user_id=%s AND week_start=%s AND name=%s "
+                "ORDER BY id DESC LIMIT %s",
+                (gid, uid, w, name.lower(), lim),
+            )
         else:
-            rows = cur.execute("""
-                SELECT name, kind, delta, set_to, note, ts_utc
-                FROM logs
-                WHERE user_id=? AND week_start=?
-                ORDER BY id DESC
-                LIMIT ?
-            """, (uid, w, lim)).fetchall()
+            cur.execute(
+                "SELECT name, kind, delta, set_to, note, ts_utc FROM logs "
+                "WHERE guild_id=%s AND user_id=%s AND week_start=%s "
+                "ORDER BY id DESC LIMIT %s",
+                (gid, uid, w, lim),
+            )
+        rows = cur.fetchall()
+        conn.close()
 
         if not rows:
             await interaction.response.send_message(
                 "No history yet for this week." + (f" (goal: `{name}`)" if name else ""),
-                ephemeral=True
+                ephemeral=True,
             )
-            conn.close(); return
+            return
 
-        # Build a compact list
         lines = []
         for r in rows:
-            goal = r["name"]
             kind = r["kind"]
             ts   = r["ts_utc"].replace("T", " ") + " UTC"
             if kind == "incremental":
@@ -653,15 +665,13 @@ class GoalsCog(commands.Cog):
                 body = f"final={r['set_to']}"
             elif kind == "boolean":
                 body = "complete ✅"
-            else:  # undo
+            else:
                 body = "undo ↩️"
+            note_str = f" — _{r['note']}_" if r["note"] else ""
+            lines.append(f"• **{r['name']}** — {body}{note_str}  ·  `{ts}`")
 
-            note = f" — _{r['note']}_" if r["note"] else ""
-            lines.append(f"• **{goal}** — {body}{note}  ·  `{ts}`")
-
-        # Reply (ephemeral to avoid channel spam)
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
-        conn.close()    
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GoalsCog(bot))

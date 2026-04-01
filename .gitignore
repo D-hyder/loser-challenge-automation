@@ -10,6 +10,12 @@ __pycache__/
 data/*.db
 data/*.bak
 data/backup_*
+*.db
+wordle_scores.json
+loser_dump.sql
+*_b64.txt
+loser_data.txt
+wordle_scores.txt
 
 # IDE/Editor
 .vscode/

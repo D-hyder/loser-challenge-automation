@@ -1,194 +1,244 @@
-import discord
-from discord.ext import commands
-from discord.ext import tasks
-import re
+# wordle_bot.py
 import json
-import os
-from pathlib import Path
+import re
 from datetime import datetime, timedelta, date
+
+import discord
+from discord.ext import commands, tasks
 import pytz
-import logging
-from config import WORDLE_DATA_PATH
 
-logging.basicConfig(level=logging.INFO)
+from database import get_db, get_active_guilds, init_db
+from config import WORDLE_BOT_TOKEN
 
-# === File Paths ===
-DATA_FILE = Path(WORDLE_DATA_PATH)
-INIT_FILE = Path("scores.json")
+CENTRAL_TZ   = pytz.timezone("America/Chicago")
+WORDLE_EPOCH = date(2021, 6, 19)   # Wordle #0
 
-if not DATA_FILE.exists() and INIT_FILE.exists():
-    with open(INIT_FILE, "r") as f:
-        data = json.load(f)
-        if "players" in data:
-            del data["players"]
-        DATA_FILE.write_text(json.dumps(data, separators=(',', ':')))
-
-# === Constants ===
-CENTRAL_TZ = pytz.timezone("America/Chicago")
-WORDLE_START_DATE = datetime(2021, 6, 19)
-
-# === Bot Setup ===
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# === Load/Save Functions ===
-def load_scores():
-    if not DATA_FILE.exists():
-        DATA_FILE.write_text("{}")
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-def save_scores(scores):
-    with open(DATA_FILE, "w") as f:
-        json.dump(scores, f, separators=(',', ':'))
-
-# === Wordle Helper ===
-# Helper: check if key is a real user record (ignore internal metadata)
-def _is_user_record(k, v):
-    return isinstance(v, dict) and not str(k).startswith("_") and ("total" in v and "games" in v)
-
-_DEF_META = {
-    "last_podium": {"gold": [], "silver": [], "bronze": [], "waffle": []},
-    "skip_penalty_days": [],   # list of ISO dates (YYYY-MM-DD) to not penalize
-    "last_penalized_day": ""   # ISO date we last processed (idempotence)
-}
-
-
-def ensure_meta(scores: dict):
-    if not isinstance(scores, dict):
-        return {"_meta": dict(_DEF_META)}
-    meta = scores.get("_meta")
-    if not isinstance(meta, dict):
-        scores["_meta"] = dict(_DEF_META)
-    else:
-        for k, v in _DEF_META.items():
-            scores["_meta"].setdefault(k, v)
-    return scores
-
-# Use universal Wordle epoch to avoid timezone/anchor drift
-WORDLE_EPOCH = date(2021, 6, 19)  # Wordle #0 release date (universal)
 
 def wordle_to_date(wordle_num: int) -> date:
     return WORDLE_EPOCH + timedelta(days=int(wordle_num))
 
+
 def date_to_wordle(some_date: date) -> int:
     return (some_date - WORDLE_EPOCH).days
 
-async def build_leaderboard_text():
-    scores = load_scores()
-    ensure_meta(scores)
-    if not scores:
+
+# ── Bot setup ─────────────────────────────────────────────────────────────────
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def get_wordle_user(guild_id: int, user_id: int):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM wordle_users WHERE guild_id=%s AND user_id=%s", (guild_id, user_id)
+    )
+    row = cur.fetchone(); conn.close()
+    return row
+
+
+def upsert_wordle_user(guild_id: int, user_id: int, **kwargs):
+    """Insert or update specific columns in wordle_users."""
+    conn = get_db(); cur = conn.cursor()
+    if kwargs:
+        cols = list(kwargs.keys()); vals = list(kwargs.values())
+        col_str    = ", ".join(["guild_id", "user_id"] + cols)
+        ph_str     = ", ".join(["%s"] * (2 + len(cols)))
+        set_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols)
+        cur.execute(
+            f"INSERT INTO wordle_users ({col_str}) VALUES ({ph_str}) "
+            f"ON CONFLICT (guild_id, user_id) DO UPDATE SET {set_clause}",
+            [guild_id, user_id] + vals,
+        )
+    else:
+        cur.execute(
+            "INSERT INTO wordle_users (guild_id, user_id) VALUES (%s, %s) "
+            "ON CONFLICT DO NOTHING",
+            (guild_id, user_id),
+        )
+    conn.commit(); conn.close()
+
+
+def get_wordle_score(guild_id: int, user_id: int, wordle_num: str) -> int | None:
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT tries FROM wordle_scores WHERE guild_id=%s AND user_id=%s AND wordle_num=%s",
+        (guild_id, user_id, wordle_num),
+    )
+    row = cur.fetchone(); conn.close()
+    return row["tries"] if row else None
+
+
+def upsert_wordle_score(guild_id: int, user_id: int, wordle_num: str, tries: int):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO wordle_scores (guild_id, user_id, wordle_num, tries)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (guild_id, user_id, wordle_num) DO UPDATE SET tries=EXCLUDED.tries
+        """,
+        (guild_id, user_id, wordle_num, tries),
+    )
+    conn.commit(); conn.close()
+
+
+def get_wordle_meta(guild_id: int) -> dict:
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT * FROM wordle_meta WHERE guild_id=%s", (guild_id,))
+    row = cur.fetchone(); conn.close()
+    if not row:
+        return {
+            "guild_id": guild_id,
+            "last_podium": {"gold": [], "silver": [], "bronze": [], "waffle": []},
+            "skip_penalty_days": [],
+            "last_penalized_day": "",
+        }
+    return {
+        "guild_id": row["guild_id"],
+        "last_podium": json.loads(row["last_podium"] or "{}"),
+        "skip_penalty_days": json.loads(row["skip_penalty_days"] or "[]"),
+        "last_penalized_day": row["last_penalized_day"] or "",
+    }
+
+
+def save_wordle_meta(guild_id: int, meta: dict):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO wordle_meta (guild_id, last_podium, skip_penalty_days, last_penalized_day)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET
+            last_podium=EXCLUDED.last_podium,
+            skip_penalty_days=EXCLUDED.skip_penalty_days,
+            last_penalized_day=EXCLUDED.last_penalized_day
+        """,
+        (
+            guild_id,
+            json.dumps(meta.get("last_podium", {})),
+            json.dumps(meta.get("skip_penalty_days", [])),
+            meta.get("last_penalized_day", ""),
+        ),
+    )
+    conn.commit(); conn.close()
+
+
+# ── Leaderboard ───────────────────────────────────────────────────────────────
+
+async def build_leaderboard_text(guild_id: int) -> str:
+    meta   = get_wordle_meta(guild_id)
+    podium = meta.get("last_podium", {})
+
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT wu.user_id, wu.total,
+               COUNT(ws.wordle_num) AS game_count
+        FROM wordle_users wu
+        LEFT JOIN wordle_scores ws
+               ON wu.guild_id = ws.guild_id AND wu.user_id = ws.user_id
+        WHERE wu.guild_id = %s
+        GROUP BY wu.user_id, wu.total
+        ORDER BY wu.total ASC
+        """,
+        (guild_id,),
+    )
+    entries = cur.fetchall(); conn.close()
+
+    if not entries:
         return "No scores yet."
 
-    podium = scores["_meta"].get("last_podium", {"gold": [], "silver": [], "bronze": [], "waffle": []})
-
-    entries = [(uid, data) for uid, data in scores.items()
-               if isinstance(data, dict) and not str(uid).startswith("_")
-               and "total" in data and "games" in data]
-    entries.sort(key=lambda x: x[1]["total"])
-
-    def medal_for(uid: str) -> str:
-        if uid in podium.get("gold", []):   return "👑 "
-        if uid in podium.get("silver", []): return "🥈 "
-        if uid in podium.get("bronze", []): return "🥉 "
-        if uid in podium.get("waffle", []): return "🧇 "
+    def medal(uid: int) -> str:
+        s = str(uid)
+        if s in podium.get("gold",   []): return "👑 "
+        if s in podium.get("silver", []): return "🥈 "
+        if s in podium.get("bronze", []): return "🥉 "
+        if s in podium.get("waffle", []): return "🧇 "
         return ""
 
     lines = []
-    for uid, data in entries:
+    for row in entries:
+        uid  = row["user_id"]
         user = await bot.fetch_user(int(uid))
-        gp = len(data["games"])
-        lines.append(f"{medal_for(uid)}**{user.display_name}** — {data['total']} tries over {gp} games")
-
+        lines.append(
+            f"{medal(uid)}**{user.display_name}** — "
+            f"{row['total']} tries over {row['game_count']} games"
+        )
     return "__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines)
 
-# === Scheduler ===
-@tasks.loop(hours=1)
-async def daily_penalty_check():
-    now = datetime.now(CENTRAL_TZ)
 
-    # We run during the midnight hour CST, and we only want to apply once per day
-    if now.hour != 0:
+# ── Scheduled penalty/alert helpers ──────────────────────────────────────────
+
+async def _process_daily_penalty(cfg: dict, now: datetime):
+    guild_id   = cfg["guild_id"]
+    target_day = (now.date() - timedelta(days=1))
+    stamp      = target_day.isoformat()
+    meta       = get_wordle_meta(guild_id)
+
+    if meta.get("last_penalized_day") == stamp:
         return
 
-    scores = load_scores()
-    ensure_meta(scores)
-
-    target_day = (now.date() - timedelta(days=1))           # penalize yesterday's Wordle
-    stamp = target_day.isoformat()
-
-    # Already processed this day? bail
-    if scores["_meta"].get("last_penalized_day") == stamp:
-        return
-
-    # Admin asked to skip this day? mark as processed and bail
-    if stamp in scores["_meta"].get("skip_penalty_days", []):
-        scores["_meta"]["last_penalized_day"] = stamp
-        scores["_meta"]["skip_penalty_days"] = [
-            d for d in scores["_meta"]["skip_penalty_days"] if d != stamp
-        ]
-        save_scores(scores)
+    if stamp in meta.get("skip_penalty_days", []):
+        meta["last_penalized_day"] = stamp
+        meta["skip_penalty_days"]  = [d for d in meta["skip_penalty_days"] if d != stamp]
+        save_wordle_meta(guild_id, meta)
         return
 
     wordle_num = str(date_to_wordle(target_day))
 
-    # Penalize only joined players who didn't submit
-    joined_users = {
-        uid for uid, data in scores.items()
-        if isinstance(data, dict) and data.get("joined")
-    }
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, total FROM wordle_users WHERE guild_id=%s AND joined=TRUE", (guild_id,)
+    )
+    joined = cur.fetchall(); conn.close()
+
     penalized = []
-    for uid in joined_users:
-        if wordle_num not in scores[uid]["games"]:
-            scores[uid]["games"][wordle_num] = 7
-            scores[uid]["total"] += 7
+    for wu in joined:
+        uid = wu["user_id"]
+        if get_wordle_score(guild_id, uid, wordle_num) is None:
+            upsert_wordle_score(guild_id, uid, wordle_num, 7)
+            upsert_wordle_user(guild_id, uid, total=wu["total"] + 7)
             penalized.append(uid)
 
-    # Mark processed and save
-    scores["_meta"]["last_penalized_day"] = stamp
-    save_scores(scores)
+    meta["last_penalized_day"] = stamp
+    save_wordle_meta(guild_id, meta)
 
     if penalized:
-        channel = discord.utils.get(bot.get_all_channels(), name="general")
+        channel = _alert_channel(cfg)
         if channel:
             mentions = ", ".join(f"<@{uid}>" for uid in penalized)
-            await channel.send(f"⏰ Auto-penalty: {mentions} were given 7 tries for missing Wordle #{wordle_num}.")
+            await channel.send(
+                f"⏰ Auto-penalty: {mentions} were given 7 tries for missing Wordle #{wordle_num}."
+            )
 
 
-MISSING_CHANNEL_ID = "900458273117982791"  # optional channel ID
-
-@tasks.loop(hours=1)
-async def nightly_missing_alert():
-    now = datetime.now(CENTRAL_TZ)
-    if now.hour != 20:  # 8 PM Central
-        return
-
-    scores = load_scores()
-    ensure_meta(scores)
-
-    # 🔒 If today is marked as a skip-penalty day (e.g., resetweek run on Sunday),
-    #     then don't nag people with reminders either.
-    today = now.date()
+async def _process_missing_alert(cfg: dict, now: datetime):
+    guild_id  = cfg["guild_id"]
+    today     = now.date()
     today_iso = today.isoformat()
-    if today_iso in scores["_meta"].get("skip_penalty_days", []):
+    meta      = get_wordle_meta(guild_id)
+
+    if today_iso in meta.get("skip_penalty_days", []):
         return
 
     wordle_num = str(date_to_wordle(today))
 
-    joined_users = {
-        uid for uid, data in scores.items()
-        if isinstance(data, dict) and data.get("joined")
-    }
-    missing_ids = [uid for uid in joined_users if wordle_num not in scores[uid]["games"]]
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id FROM wordle_users WHERE guild_id=%s AND joined=TRUE", (guild_id,)
+    )
+    joined = cur.fetchall(); conn.close()
+
+    missing_ids = [
+        wu["user_id"] for wu in joined
+        if get_wordle_score(guild_id, wu["user_id"], wordle_num) is None
+    ]
     if not missing_ids:
         return
 
-    channel = None
-    if MISSING_CHANNEL_ID and MISSING_CHANNEL_ID.isdigit():
-        channel = bot.get_channel(int(MISSING_CHANNEL_ID))
-    if channel is None:
-        channel = discord.utils.get(bot.get_all_channels(), name="general")
+    channel = _alert_channel(cfg)
     if channel is None:
         return
 
@@ -202,251 +252,335 @@ async def nightly_missing_alert():
 
     if names:
         mentions = ", ".join(f"<@{uid}>" for uid in missing_ids)
-        await channel.send(f"⏰ Reminder: {mentions} still need to submit today’s Wordle!")
+        await channel.send(f"⏰ Reminder: {mentions} still need to submit today's Wordle!")
 
-# === Bot Events ===
+
+def _alert_channel(cfg: dict) -> discord.TextChannel | None:
+    """Return the alert channel for a guild config, falling back to #general."""
+    guild_id = cfg["guild_id"]
+    guild    = bot.get_guild(guild_id)
+    if guild is None:
+        return None
+    cid = cfg.get("missing_channel_id") or cfg.get("wordle_channel_id")
+    if cid:
+        ch = guild.get_channel(int(cid))
+        if ch:
+            return ch
+    return discord.utils.get(guild.text_channels, name="general")
+
+
+# ── Hourly tasks ──────────────────────────────────────────────────────────────
+
+@tasks.loop(hours=1)
+async def daily_penalty_check():
+    now = datetime.now(CENTRAL_TZ)
+    if now.hour != 0:
+        return
+    for cfg in get_active_guilds():
+        try:
+            await _process_daily_penalty(cfg, now)
+        except Exception as e:
+            print(f"ERROR daily_penalty guild {cfg['guild_id']}: {e}")
+
+
+@tasks.loop(hours=1)
+async def nightly_missing_alert():
+    now = datetime.now(CENTRAL_TZ)
+    if now.hour != 20:
+        return
+    for cfg in get_active_guilds():
+        try:
+            await _process_missing_alert(cfg, now)
+        except Exception as e:
+            print(f"ERROR nightly_alert guild {cfg['guild_id']}: {e}")
+
+
+# ── Bot events ────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
-    print(f"✅ Bot is ready as {bot.user} (guilds={len(bot.guilds)})")
+    print(f"✅ Wordle bot ready as {bot.user} (guilds={len(bot.guilds)})")
+    init_db()
     daily_penalty_check.start()
     nightly_missing_alert.start()
 
+
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    if not message.guild:
+        await bot.process_commands(message)
+        return
 
+    guild_id = message.guild.id
     match = re.search(r"Wordle\s+([\d,]+)\s+(\d|X)/6", message.content)
     if match:
-        wordle_number = match.group(1).replace(",", "")  # store keys as strings
-        tries = 7 if match.group(2) == "X" else int(match.group(2))
-        user_id = str(message.author.id)
+        wordle_num = match.group(1).replace(",", "")
+        tries      = 7 if match.group(2) == "X" else int(match.group(2))
+        user_id    = message.author.id
 
-        scores = load_scores()
-        ensure_meta(scores)
-        if user_id not in scores:
-            scores[user_id] = {"total": 0, "games": {}, "joined": True, "wins": 0}
+        wu        = get_wordle_user(guild_id, user_id)
+        old_tries = get_wordle_score(guild_id, user_id, wordle_num)
 
-        if wordle_number in scores[user_id]["games"]:
-            scores[user_id]["total"] -= scores[user_id]["games"][wordle_number]
+        if wu is None:
+            upsert_wordle_user(guild_id, user_id, joined=True, total=tries, wins=0, waffles=0)
+        else:
+            delta     = tries - (old_tries or 0)
+            new_total = wu["total"] + delta
+            upsert_wordle_user(guild_id, user_id, total=new_total)
 
-        scores[user_id]["games"][wordle_number] = tries
-        scores[user_id]["total"] += tries
+        upsert_wordle_score(guild_id, user_id, wordle_num, tries)
 
-        save_scores(scores)
         await message.channel.send(
-            f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!"
+            f"✅ Wordle #{wordle_num} recorded — {tries} tries for {message.author.display_name}!"
         )
-
-        lb_text = await build_leaderboard_text()
+        lb_text = await build_leaderboard_text(guild_id)
         await message.channel.send(lb_text)
 
     await bot.process_commands(message)
 
 
-# === Commands ===
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def _require_guild(ctx) -> int | None:
+    if not ctx.guild:
+        return None
+    return ctx.guild.id
+
+
 @bot.command()
 async def leaderboard(ctx):
-    text = await build_leaderboard_text()
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    text = await build_leaderboard_text(gid)
     await ctx.send(text)
+
 
 @bot.command()
 async def joinwordle(ctx):
-    scores = load_scores()
-    uid = str(ctx.author.id)
-    if uid not in scores:
-        scores[uid] = {"total": 0, "games": {}, "joined": True, "wins": 0}
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    uid = ctx.author.id
+    wu  = get_wordle_user(gid, uid)
+    if wu is None:
+        upsert_wordle_user(gid, uid, joined=True, total=0, wins=0, waffles=0)
     else:
-        scores[uid]["joined"] = True
-    save_scores(scores)
+        upsert_wordle_user(gid, uid, joined=True)
     await ctx.send(f"{ctx.author.mention} joined the daily Wordle challenge!")
+
 
 @bot.command()
 async def leavewordle(ctx):
-    scores = load_scores()
-    uid = str(ctx.author.id)
-    if uid in scores:
-        scores[uid]["joined"] = False
-        save_scores(scores)
-        await ctx.send(f"{ctx.author.mention} left the daily Wordle challenge.")
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    uid = ctx.author.id
+    if get_wordle_user(gid, uid):
+        upsert_wordle_user(gid, uid, joined=False)
+    await ctx.send(f"{ctx.author.mention} left the daily Wordle challenge.")
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
-    scores = load_scores()
-    ensure_meta(scores)
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
 
-    # ONLY count players currently joined
-    entries = [
-        (uid, data) for uid, data in scores.items()
-        if _is_user_record(uid, data) and data.get("joined")
-    ]
-    if not entries:
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, total FROM wordle_users WHERE guild_id=%s AND joined=TRUE", (gid,)
+    )
+    entries_raw = cur.fetchall(); conn.close()
+
+    if not entries_raw:
         await ctx.send("No joined players to score this week.")
         return
 
-    # Sort by weekly total ascending (lower total = better)
-    entries.sort(key=lambda x: x[1]["total"])
-    top_total = entries[0][1]["total"]
+    entries = [(str(wu["user_id"]), wu["total"]) for wu in entries_raw]
+    entries.sort(key=lambda x: x[1])
+    top_total = entries[0][1]
 
-    # Build blocks of tied ranks (competition ranking: 1,2,2,4)
-    blocks, i = [], 0
+    # Build competition rank blocks
+    blocks: list = []
+    i = 0
     while i < len(entries):
         same = [entries[i]]
         j = i + 1
-        while j < len(entries) and entries[j][1]["total"] == entries[i][1]["total"]:
+        while j < len(entries) and entries[j][1] == entries[i][1]:
             same.append(entries[j])
             j += 1
-        rank = i + 1
-        blocks.append((rank, same))
+        blocks.append((i + 1, same))
         i = j
 
     def ids(block):
         return [uid for uid, _ in block]
 
-    # Compute last place among joined only (for waffle)
-    worst_total = max(d["total"] for _, d in entries)
-    waffle_ids = [uid for uid, d in entries if d["total"] == worst_total]
-
-    # Podium:
-    # gold  = everyone tied for best (rank 1)
-    # silver = everyone in rank 2 block (if any)
-    # bronze = everyone in rank 3 block (if any)
-    rank1, block1 = blocks[0]
-    gold_ids = ids(block1)
-
-    silver_ids = []
-    bronze_ids = []
-
-    for r, blk in blocks[1:]:
-        if r == 2 and not silver_ids:
+    worst_total = max(d for _, d in entries)
+    waffle_ids  = [uid for uid, d in entries if d == worst_total]
+    gold_ids    = ids(blocks[0][1])
+    silver_ids: list = []
+    bronze_ids: list = []
+    for rank, blk in blocks[1:]:
+        if rank == 2 and not silver_ids:
             silver_ids = ids(blk)
-        elif r == 3 and not bronze_ids:
+        elif rank == 3 and not bronze_ids:
             bronze_ids = ids(blk)
 
-    # Store last week's podium + waffle
-    scores["_meta"]["last_podium"] = {
-        "gold": gold_ids,
-        "silver": silver_ids,
-        "bronze": bronze_ids,
-        "waffle": waffle_ids,
+    # Persist podium
+    meta = get_wordle_meta(gid)
+    meta["last_podium"] = {
+        "gold": gold_ids, "silver": silver_ids,
+        "bronze": bronze_ids, "waffle": waffle_ids,
     }
 
-    # Increment wins for all gold players
+    # Increment wins & waffles
     for uid in gold_ids:
-        scores[uid]["wins"] = scores[uid].get("wins", 0) + 1
+        wu = get_wordle_user(gid, int(uid))
+        if wu:
+            upsert_wordle_user(gid, int(uid), wins=wu["wins"] + 1)
+    for uid in waffle_ids:
+        wu = get_wordle_user(gid, int(uid))
+        if wu:
+            upsert_wordle_user(gid, int(uid), waffles=wu["waffles"] + 1)
 
-    # Announce winners
+    # Announce gold
     if len(gold_ids) == 1:
-        winner_id = gold_ids[0]
-        winner_user = await bot.fetch_user(int(winner_id))
+        winner = await bot.fetch_user(int(gold_ids[0]))
         await ctx.send(
-            f"🎉 Congrats {winner_user.display_name} for winning the week with {top_total} total tries!"
+            f"🎉 Congrats {winner.display_name} for winning the week with {top_total} total tries!"
         )
     else:
-        names = []
-        for uid in gold_ids:
-            u = await bot.fetch_user(int(uid))
-            names.append(u.display_name)
-        await ctx.send(
-            f"🎉 Weekly tie! Shared gold for: {', '.join(names)} with {top_total} total tries!"
-        )
+        names = [((await bot.fetch_user(int(uid))).display_name) for uid in gold_ids]
+        await ctx.send(f"🎉 Weekly tie! Shared gold: {', '.join(names)} with {top_total} tries!")
 
-    # Announce last place (waffle) + increment waffle counters
+    # Announce waffle
     if waffle_ids:
-        names = []
-        for uid in waffle_ids:
-            # increment waffle count on the user record
-            scores[uid]["waffles"] = scores[uid].get("waffles", 0) + 1
-
-            u = await bot.fetch_user(int(uid))
-            names.append(f"🧇 {u.display_name}")
+        names = [f"🧇 {(await bot.fetch_user(int(uid))).display_name}" for uid in waffle_ids]
         await ctx.send("😬 Last place this week: " + ", ".join(names))
 
-    # --- Keep your existing Sunday-skip logic for penalties ---
+    # Add Sunday to skip-penalty days if applicable
     today_cst = datetime.now(CENTRAL_TZ).date()
-    if today_cst.weekday() == 6:   # Monday=0 ... Sunday=6
+    if today_cst.weekday() == 6:
         sunday_iso = today_cst.isoformat()
-        lst = scores["_meta"].get("skip_penalty_days", [])
+        lst = meta.get("skip_penalty_days", [])
         if sunday_iso not in lst:
             lst.append(sunday_iso)
-        scores["_meta"]["skip_penalty_days"] = lst
+        meta["skip_penalty_days"] = lst
+    save_wordle_meta(gid, meta)
 
-    # Reset week but keep wins/joined
-    for uid, data in list(scores.items()):
-        if _is_user_record(uid, data):
-            data["games"] = {}
-            data["total"] = 0
-            scores[uid] = data
+    # Reset weekly scores
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM wordle_scores WHERE guild_id=%s", (gid,))
+    cur.execute("UPDATE wordle_users SET total=0 WHERE guild_id=%s", (gid,))
+    conn.commit(); conn.close()
 
-    save_scores(scores)
     await ctx.send("Scores have been reset for the new week!")
 
 
 @bot.command()
 async def wins(ctx):
-    scores = load_scores()
-    lines = [
-        f"**{await bot.fetch_user(int(uid))}** — {data.get('wins', 0)} wins"
-        for uid, data in scores.items()
-        if isinstance(data, dict) and data.get("wins", 0) > 0
-    ]
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, wins FROM wordle_users WHERE guild_id=%s AND wins > 0", (gid,)
+    )
+    rows = cur.fetchall(); conn.close()
+    lines = []
+    for r in rows:
+        u = await bot.fetch_user(int(r["user_id"]))
+        lines.append(f"**{u.display_name}** — {r['wins']} wins")
     if lines:
         await ctx.send("__**🥇 Weekly Wins**__\n" + "\n".join(lines))
     else:
         await ctx.send("No wins recorded yet.")
 
+
 @bot.command()
 async def waffle(ctx):
-    """Show how many times each player has finished last (waffle)."""
-    scores = load_scores()
-    lines = [
-        f"**{await bot.fetch_user(int(uid))}** — {data.get('waffles', 0)} waffles"
-        for uid, data in scores.items()
-        if isinstance(data, dict) and data.get("waffles", 0) > 0
-    ]
-
+    """Show how many times each player has finished last."""
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, waffles FROM wordle_users WHERE guild_id=%s AND waffles > 0", (gid,)
+    )
+    rows = cur.fetchall(); conn.close()
+    lines = []
+    for r in rows:
+        u = await bot.fetch_user(int(r["user_id"]))
+        lines.append(f"**{u.display_name}** — {r['waffles']} waffles")
     if lines:
         await ctx.send("__**🧇 Waffle Count**__\n" + "\n".join(lines))
     else:
-        await ctx.send("No waffles recorded yet. Everyone’s safe… for now.")
+        await ctx.send("No waffles recorded yet. Everyone's safe… for now.")
+
 
 @bot.command()
 async def missing(ctx):
-    scores = load_scores()
-    today = datetime.now(CENTRAL_TZ).date()
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    today      = datetime.now(CENTRAL_TZ).date()
     wordle_num = str(date_to_wordle(today))
 
-    joined_users = {
-        uid for uid, data in scores.items()
-        if isinstance(data, dict) and data.get("joined")
-    }
-    missing = [
-        await bot.fetch_user(int(uid)) for uid in joined_users
-        if wordle_num not in scores[uid]["games"]
-    ]
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id FROM wordle_users WHERE guild_id=%s AND joined=TRUE", (gid,)
+    )
+    joined = cur.fetchall(); conn.close()
 
-    if missing:
-        await ctx.send("__**📋 Players Missing Today's Wordle**__\n" + ", ".join(user.name for user in missing))
+    missing_users = [
+        await bot.fetch_user(int(wu["user_id"]))
+        for wu in joined
+        if get_wordle_score(gid, wu["user_id"], wordle_num) is None
+    ]
+    if missing_users:
+        await ctx.send(
+            "__**📋 Players Missing Today's Wordle**__\n"
+            + ", ".join(u.name for u in missing_users)
+        )
     else:
         await ctx.send("✅ Everyone has submitted today's Wordle!")
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def backup(ctx):
-    """Create a backup and upload it as a file in Discord."""
-    scores = load_scores()
-    ts = datetime.now(CENTRAL_TZ).strftime("%Y%m%d_%H%M%S")
-    fn = f"scores_backup_{ts}.json"
-    path = f"/tmp/{fn}"
+    """Export Wordle data as a JSON attachment."""
+    gid = _require_guild(ctx)
+    if gid is None:
+        await ctx.send("This command must be used in a server.")
+        return
+    import io
 
-    # write to /tmp (still handy if you want to shell in later)
-    with open(path, "w") as f:
-        json.dump(scores, f, indent=2)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT * FROM wordle_users  WHERE guild_id=%s", (gid,))
+    users = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT * FROM wordle_scores WHERE guild_id=%s", (gid,))
+    scores = [dict(r) for r in cur.fetchall()]
+    conn.close()
 
-    # upload the file to the channel
-    await ctx.send(
-        content="💾 Backup created:",
-        file=discord.File(path, filename=fn)
-    )
-
+    data = {
+        "guild_id": gid,
+        "wordle_users": users,
+        "wordle_scores": scores,
+        "wordle_meta": get_wordle_meta(gid),
+    }
+    ts   = datetime.now(CENTRAL_TZ).strftime("%Y%m%d_%H%M%S")
+    fn   = f"wordle_backup_{ts}.json"
+    buf  = io.BytesIO(json.dumps(data, indent=2, default=str).encode())
+    await ctx.send(content="💾 Wordle backup:", file=discord.File(buf, filename=fn))
